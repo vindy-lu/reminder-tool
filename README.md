@@ -22,19 +22,17 @@
 | 📅 **灵活定时** | 支持每天 / 每周，可勾选周一到周日任意组合 |
 | ✏️ **双击编辑** | 双击任务行弹出编辑框，改完一键保存重建 |
 | 🧪 **实时预览** | 添加前可"立即测试弹窗"预览效果 |
-| 🚫 **免安装** | 打包为独立 exe，无需安装 Python，双击即用 |
+| 🚫 **免安装** | 独立 exe，无需安装 Python，双击即用 |
 
 ## 📸 界面预览
 
-> 截图待补充。建议在仓库根目录添加以下两张图片，并替换下面的图片链接：
-> - `screenshot_main.png` —— 管理工具主界面
-> - `screenshot_popup.png` —— 提醒弹窗效果
->
-> 添加后把下面两行的文件名替换为实际文件名即可：
+**管理工具**
 
-| 管理工具 | 提醒弹窗 |
-|---------|---------|
-| ![管理工具](screenshot_main.png) | ![提醒弹窗](screenshot_popup.png) |
+![管理工具](screenshot_main.png)
+
+**提醒弹窗**
+
+![提醒弹窗](screenshot_popup.png)
 
 ## 📥 下载使用
 
@@ -76,43 +74,6 @@ A: 列表选中任务 → 点"🗑️ 删除选中任务"。
 
 **Q: 换电脑/重装系统后任务还在吗？**
 A: 任务存在 Windows 计划任务里，重装系统会丢失。重新添加即可（数据不涉及文件存储）。
-
-## 🛠️ 从源码运行（开发者）
-
-需要 Python 3.10+（仅用标准库，无第三方依赖）：
-
-```bash
-git clone https://github.com/vindy-lu/reminder-tool.git
-cd reminder-tool
-python reminder_manager.py
-```
-
-**打包为 exe**（需安装 PyInstaller）：
-
-```bash
-pip install pyinstaller
-pyinstaller --noconfirm --onefile --windowed --name ReminderManager reminder_manager.py
-pyinstaller --noconfirm --onefile --windowed --name ClockReminder clock_reminder.py
-# 两个 exe 需放在同一目录使用
-```
-
-## 📁 项目结构
-
-```
-reminder-tool/
-├── reminder_manager.py   # 可视化管理工具（主程序）
-├── clock_reminder.py     # 弹窗脚本（被计划任务调用）
-├── README.md
-└── LICENSE               # MIT
-```
-
-## 🗺️ 路线图
-
-- [x] 基础增删改查 + 定时弹窗
-- [x] 打包独立 exe 发布
-- [ ] 开机自启动设置
-- [ ] 弹窗音效/提醒铃声
-- [ ] 多语言支持
 
 ## 📄 开源协议
 
