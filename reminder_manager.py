@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 import tkinter as tk
+from datetime import datetime, timedelta
 from tkinter import ttk, messagebox
 
 PYTHON = sys.executable
@@ -42,6 +43,97 @@ WEEKDAY_MAP = {
 }
 WEEKDAY_CN = {v: k for k, v in WEEKDAY_MAP.items()}
 
+# 任务计划允许的三种计划方式
+SCHEDULE_TYPES = ["每天", "每周", "一次性"]
+
+# Windows 任务计划不接受的任务名字符 -> 全角替代
+# 任务名最终对应 C:\Windows\System32\Tasks 下的文件名，: / \ * ? " < > | 以及 ".."
+# 这类路径字符会让 schtasks 直接报"参数错误"，换成全角后视觉几乎一致且合法。
+NAME_CHAR_MAP = {
+    ":": "：", "*": "＊", "?": "？", '"': "”",
+    "<": "＜", ">": "＞", "|": "｜", "/": "／", "\\": "＼",
+}
+
+
+def normalize_task_name(name):
+    """清洗任务名，返回 (新名字, 替换说明列表)。"""
+    clean = (name or "").strip()
+    replaced = []
+    for bad, good in NAME_CHAR_MAP.items():
+        if bad in clean:
+            clean = clean.replace(bad, good)
+            replaced.append("{} → {}".format(bad, good))
+    if ".." in clean:
+        clean = re.sub(r"\.{2,}", lambda m: "．" * len(m.group(0)), clean)
+        replaced.append(".. → ．．")
+    if clean.endswith("."):
+        clean = clean[:-1] + "．"
+        replaced.append("结尾的 . → ．")
+    return clean.strip(), replaced
+
+
+def normalize_time(time_str):
+    """校验并规范化 HH:MM，非法返回 None。"""
+    m = re.fullmatch(r"(\d{1,2})\s*[:：]\s*(\d{1,2})", (time_str or "").strip())
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return "{:02d}:{:02d}".format(hour, minute)
+
+
+def normalize_date(date_str):
+    """接受 2026-12-01 / 2026/12/01 / 2026年12月1日，返回 (YYYY/MM/DD, YYYY-MM-DD)。"""
+    s = (date_str or "").strip()
+    if not s:
+        return None
+    s = s.replace("年", "-").replace("月", "-").replace("日", " ")
+    s = s.split()[0].replace("/", "-").replace(".", "-")
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if not m:
+        return None
+    try:
+        dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+    return dt.strftime("%Y/%m/%d"), dt.strftime("%Y-%m-%d")
+
+
+def validate_form(name, title, text, schedule, time_str, weekdays, date_str):
+    """统一校验添加/编辑表单，返回 (values, error)。error 非空即校验失败。"""
+    name = (name or "").strip()
+    if not name or not (title or "").strip() or not (text or "").strip():
+        return None, "任务名、标题、内容不能为空"
+    if re.search(r"[\U0001F000-\U0001FAFF\u2300-\u23FF\u2600-\u27BF\u2B00-\u2BFF\uFE0F]", name):
+        return None, ("任务名不支持 emoji 图标，请使用中文/英文/数字。\n"
+                      "emoji 可以放在弹窗标题或内容里。")
+    clean_name, replaced = normalize_task_name(name)
+    if not clean_name:
+        return None, "任务名去掉非法字符后为空，请换一个名字"
+    norm_time = normalize_time(time_str)
+    if norm_time is None:
+        return None, "时间格式不对，应为 HH:MM，例如 17:00"
+    norm_date = None
+    if schedule == "一次性":
+        norm_date = normalize_date(date_str)
+        if norm_date is None:
+            return None, ("一次性任务必须填执行日期，格式 YYYY-MM-DD，\n"
+                          "例如 2026-12-01。")
+    if schedule == "每周" and not weekdays:
+        return None, "请至少勾选一个星期几"
+    return {
+        "name": clean_name,
+        "replaced": replaced,
+        "title": title.strip(),
+        "text": text.strip(),
+        "schedule": schedule,
+        "time": norm_time,
+        "weekdays": weekdays,
+        "date": norm_date[1] if norm_date else "",
+        "date_arg": norm_date[0] if norm_date else None,
+    }, ""
+
 
 def run_cmd(args):
     """执行命令，返回 (成功?, 输出)。schtasks 输出是 GBK，需按系统编码解码"""
@@ -60,14 +152,20 @@ def run_cmd(args):
 
 def parse_task_detail(full_name):
     """查询单个任务详情，返回 dict 或 None。
-    dict: name(显示名), title, text, button, schedule(每天/每周), time, weekdays, next_run
+    dict: name(显示名), title, text, button, schedule(每天/每周/一次性),
+          time, weekdays, next_run, date
     """
     ok, out = run_cmd(["schtasks", "-Query", "-TN", full_name, "-V", "-FO", "LIST"])
     if not ok:
         return None
+    return parse_detail_output(out, full_name)
+
+
+def parse_detail_output(out, full_name):
+    """解析 schtasks -V -FO LIST 的文本。抽成纯函数方便单元测试。"""
     detail = {"name": full_name[len(TASK_PREFIX):], "title": "", "text": "",
               "button": "", "schedule": "每天", "time": "", "weekdays": [],
-              "next_run": ""}
+              "next_run": "", "date": ""}
 
     # 要运行的任务 -> 提取 --title/--text/--button
     m = re.search(r"要运行的任务:\s*([^\r\n]+)", out)
@@ -82,13 +180,26 @@ def parse_task_detail(full_name):
     m = re.search(r"计划类型:\s*([^\r\n]+)", out)
     if m:
         stype = m.group(1).strip()
-        detail["schedule"] = "每周" if "周" in stype else "每天"
+        low = stype.lower()
+        if "一次" in stype or "once" in low:
+            detail["schedule"] = "一次性"
+        elif "周" in stype or "weekly" in low:
+            detail["schedule"] = "每周"
+        else:
+            detail["schedule"] = "每天"
     m = re.search(r"开始时间:\s*([^\r\n]+)", out)
     if m:
         t = m.group(1).strip()
         # 9:30:00 / 17:00:00 -> 09:30 / 17:00
         parts = t.split(":")
         detail["time"] = f"{int(parts[0]):02d}:{int(parts[1]):02d}" if len(parts) >= 2 else t
+    # 开始日期：一次性任务用它显示具体哪一天
+    m = (re.search(r"开始日期:\s*([^\r\n]+)", out)
+         or re.search(r"Start Date:\s*([^\r\n]+)", out))
+    if m:
+        nd = normalize_date(m.group(1).strip())
+        if nd:
+            detail["date"] = nd[1]
     m = re.search(r"天:\s*([^\r\n]+)", out)
     if m:
         days = m.group(1).strip()
@@ -121,16 +232,22 @@ def list_tasks():
     return [parse_task_detail(t) for t in tasks if parse_task_detail(t)]
 
 
-def build_trigger(schedule_type, time_str, weekdays):
-    """构造 schtasks 的触发参数"""
+def build_trigger(schedule_type, time_str, weekdays, date_str=None):
+    """构造 schtasks 的触发参数
+
+    一次性任务用 ONCE + -Z：执行完这一次后由系统自动删除任务，
+    不用再手动清理（用户说的"一次性提醒"）。
+    """
+    if schedule_type == "一次性":
+        return ["-SC", "ONCE", "-SD", date_str, "-ST", time_str, "-Z"]
     if schedule_type == "每周":
         days = ",".join(WEEKDAY_MAP[d] for d in weekdays)
         return ["-SC", "WEEKLY", "-D", days, "-ST", time_str]
     return ["-SC", "DAILY", "-ST", time_str]
 
 
-def add_task(name, title, text, button, schedule_type, time_str, weekdays):
-    """添加任务"""
+def add_task(name, title, text, button, schedule_type, time_str, weekdays, date_str=None):
+    """添加任务（name 已经过 normalize_task_name 清洗）"""
     task_name = TASK_PREFIX + name
     # 用 script_invocation() 拼命令行：exe 直接调用，py 用 python 解释器
     inv = script_invocation()
@@ -138,7 +255,7 @@ def add_task(name, title, text, button, schedule_type, time_str, weekdays):
     cmd = ["schtasks", "-Create", "-TN", task_name, "-F",
            "-TR",
            f'{cmd_str} --title "{title}" --text "{text}" --button "{button}"']
-    cmd += build_trigger(schedule_type, time_str, weekdays)
+    cmd += build_trigger(schedule_type, time_str, weekdays, date_str)
     return run_cmd(cmd)
 
 
@@ -177,7 +294,7 @@ class EditDialog:
 
         self.dlg = tk.Toplevel(parent)
         self.dlg.title(f"编辑任务 - {detail['name']}")
-        self.dlg.geometry("520x420")
+        self.dlg.geometry("580x430")
         self.dlg.resizable(False, False)
         self.dlg.grab_set()  # 模态
         self.dlg.attributes("-topmost", True)
@@ -192,6 +309,8 @@ class EditDialog:
         self.var_button = tk.StringVar(value=detail["button"])
         self.var_schedule = tk.StringVar(value=detail["schedule"])
         self.var_time = tk.StringVar(value=detail["time"])
+        self.var_date = tk.StringVar(value=detail.get("date") or
+                                     (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
         self.var_weekdays = {d: tk.BooleanVar(value=d in detail["weekdays"])
                              for d in WEEKDAY_MAP}
 
@@ -208,12 +327,16 @@ class EditDialog:
         freq_frame = tk.Frame(body)
         freq_frame.grid(row=4, column=1, sticky="w", pady=4)
         self.sched_combo = ttk.Combobox(freq_frame, textvariable=self.var_schedule,
-                                        values=["每天", "每周"], width=6,
+                                        values=SCHEDULE_TYPES, width=8,
                                         state="readonly", font=("Microsoft YaHei", 10))
         self.sched_combo.pack(side="left")
         self.sched_combo.bind("<<ComboboxSelected>>", self.on_schedule_change)
         tk.Label(freq_frame, text="时间", font=("Microsoft YaHei", 10)).pack(side="left", padx=(10, 4))
         tk.Entry(freq_frame, textvariable=self.var_time, width=7, font=("Microsoft YaHei", 10)).pack(side="left")
+        tk.Label(freq_frame, text="日期", font=("Microsoft YaHei", 10)).pack(side="left", padx=(10, 4))
+        self.date_entry = tk.Entry(freq_frame, textvariable=self.var_date, width=11,
+                                   font=("Microsoft YaHei", 10))
+        self.date_entry.pack(side="left")
 
         week_frame = tk.Frame(body)
         week_frame.grid(row=5, column=1, sticky="w", pady=4)
@@ -225,7 +348,7 @@ class EditDialog:
             self.week_checks.append(cb)
         self.on_schedule_change()  # 初始化置灰状态
 
-        hint = tk.Label(body, text="提示：任务名不支持 emoji，emoji 可放标题/内容",
+        hint = tk.Label(body, text="提示：任务名不支持 emoji；: / \\ * ? \" < > | 会自动换成全角。",
                         font=("Microsoft YaHei", 9), fg="gray")
         hint.grid(row=6, column=0, columnspan=2, pady=(6, 0))
 
@@ -240,30 +363,33 @@ class EditDialog:
                   font=("Microsoft YaHei", 10)).pack(side="right")
 
     def on_schedule_change(self, event=None):
-        """频率切换联动：每天时星期勾选置灰，每周时启用"""
-        state = "normal" if self.var_schedule.get() == "每周" else "disabled"
+        """频率切换联动：每周才启用星期勾选，一次性才启用日期输入"""
+        kind = self.var_schedule.get()
+        week_state = "normal" if kind == "每周" else "disabled"
         for cb in self.week_checks:
-            cb.config(state=state)
+            cb.config(state=week_state)
+        self.date_entry.config(state="normal" if kind == "一次性" else "disabled")
+        if kind == "一次性" and not self.var_date.get().strip():
+            self.var_date.set((datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
 
     def collect(self):
-        name = self.var_name.get().strip()
-        title = self.var_title.get().strip()
-        text = self.var_text.get().strip()
-        button = self.var_button.get().strip()
-        time_str = self.var_time.get().strip()
-        if not name or not title or not text:
-            messagebox.showwarning("提示", "任务名、标题、内容不能为空", parent=self.dlg)
-            return None
-        if re.search(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", name):
-            messagebox.showwarning("提示", "任务名不支持 emoji，请使用中文/英文/数字",
-                                   parent=self.dlg)
-            return None
         weekdays = [d for d, var in self.var_weekdays.items() if var.get()]
-        if self.var_schedule.get() == "每周" and not weekdays:
-            messagebox.showwarning("提示", "请至少勾选一个星期几", parent=self.dlg)
+        values, error = validate_form(
+            self.var_name.get(), self.var_title.get(), self.var_text.get(),
+            self.var_schedule.get(), self.var_time.get(), weekdays,
+            self.var_date.get())
+        if values is None:
+            messagebox.showwarning("提示", error, parent=self.dlg)
             return None
-        return dict(name=name, title=title, text=text, button=button,
-                    schedule=self.var_schedule.get(), time=time_str, weekdays=weekdays)
+        if values["replaced"]:
+            messagebox.showinfo(
+                "任务名已自动修正",
+                "Windows 任务计划不接受这些字符，已换成全角：\n\n"
+                + "\n".join(values["replaced"])
+                + "\n\n新任务名：" + values["name"],
+                parent=self.dlg)
+        values["button"] = self.var_button.get().strip()
+        return values
 
     def test(self):
         d = self.collect()
@@ -282,9 +408,11 @@ class EditDialog:
         if self.old_name != d["name"]:
             delete_task(TASK_PREFIX + self.old_name)
         ok, out = add_task(d["name"], d["title"], d["text"], d["button"],
-                           d["schedule"], d["time"], d["weekdays"])
+                           d["schedule"], d["time"], d["weekdays"], d["date_arg"])
         if ok:
-            messagebox.showinfo("成功", f"任务 [{d['name']}] 已保存", parent=self.dlg)
+            note = "（提醒后会自行删除）" if d["schedule"] == "一次性" else ""
+            messagebox.showinfo("成功", f"任务 [{d['name']}] 已保存{note}",
+                                parent=self.dlg)
             self.dlg.destroy()
             self.on_save()
         else:
@@ -333,6 +461,8 @@ class ReminderManager:
         self.var_button = tk.StringVar(value="我知道了")
         self.var_schedule = tk.StringVar(value="每天")
         self.var_time = tk.StringVar(value="17:00")
+        self.var_date = tk.StringVar(
+            value=(datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
         self.var_weekdays = {d: tk.BooleanVar() for d in WEEKDAY_MAP}
 
         grid = tk.Frame(bottom)
@@ -351,13 +481,18 @@ class ReminderManager:
         freq_frame = tk.Frame(grid)
         freq_frame.grid(row=4, column=1, sticky="w", pady=3)
         self.sched_combo = ttk.Combobox(freq_frame, textvariable=self.var_schedule,
-                                        values=["每天", "每周"], width=6,
+                                        values=SCHEDULE_TYPES, width=8,
                                         state="readonly", font=("Microsoft YaHei", 10))
         self.sched_combo.pack(side="left")
         self.sched_combo.bind("<<ComboboxSelected>>", self.on_schedule_change)
         tk.Label(freq_frame, text="时间", font=("Microsoft YaHei", 10)).pack(side="left", padx=(10, 4))
         tk.Entry(freq_frame, textvariable=self.var_time, width=7, font=("Microsoft YaHei", 10)).pack(side="left")
         tk.Label(freq_frame, text="(格式 17:00)", font=("Microsoft YaHei", 9), fg="gray").pack(side="left", padx=6)
+        tk.Label(freq_frame, text="日期", font=("Microsoft YaHei", 10)).pack(side="left", padx=(10, 4))
+        self.date_entry = tk.Entry(freq_frame, textvariable=self.var_date, width=11,
+                                   font=("Microsoft YaHei", 10))
+        self.date_entry.pack(side="left")
+        tk.Label(freq_frame, text="(一次性用)", font=("Microsoft YaHei", 9), fg="gray").pack(side="left", padx=6)
 
         week_frame = tk.Frame(grid)
         week_frame.grid(row=5, column=1, sticky="w", pady=3)
@@ -381,15 +516,21 @@ class ReminderManager:
 
     # ---------- 功能 ----------
     def on_schedule_change(self, event=None):
-        """频率切换联动：每天时星期勾选置灰，每周时启用"""
-        state = "normal" if self.var_schedule.get() == "每周" else "disabled"
+        """频率切换联动：每周才启用星期勾选，一次性才启用日期输入"""
+        kind = self.var_schedule.get()
+        week_state = "normal" if kind == "每周" else "disabled"
         for cb in self.week_checks:
-            cb.config(state=state)
+            cb.config(state=week_state)
+        self.date_entry.config(state="normal" if kind == "一次性" else "disabled")
+        if kind == "一次性" and not self.var_date.get().strip():
+            self.var_date.set((datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"))
 
     def refresh(self):
         self.tree.delete(*self.tree.get_children())
         for d in list_tasks():
-            if d["schedule"] == "每周" and d["weekdays"]:
+            if d["schedule"] == "一次性":
+                plan = "一次性 " + " ".join(x for x in (d.get("date"), d.get("time")) if x)
+            elif d["schedule"] == "每周" and d["weekdays"]:
                 # 压缩显示：周一,周二,周三,周四,周五 -> 周一-周五
                 plan = "每周 " + compress_weekdays(d["weekdays"])
             else:
@@ -437,27 +578,27 @@ class ReminderManager:
         EditDialog(self.root, detail, on_save=self.refresh)
 
     def add(self):
-        name = self.var_name.get().strip()
-        title = self.var_title.get().strip()
-        text = self.var_text.get().strip()
-        button = self.var_button.get().strip()
-        time_str = self.var_time.get().strip()
-        if not name or not title or not text:
-            messagebox.showwarning("提示", "任务名、标题、内容不能为空")
-            return
-        if re.search(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", name):
-            messagebox.showwarning("提示",
-                                   "任务名不支持 emoji 图标，请使用中文/英文/数字。\n"
-                                   "emoji 可以放在弹窗标题或内容里。")
-            return
         weekdays = [d for d, var in self.var_weekdays.items() if var.get()]
-        if self.var_schedule.get() == "每周" and not weekdays:
-            messagebox.showwarning("提示", "请至少勾选一个星期几")
+        values, error = validate_form(
+            self.var_name.get(), self.var_title.get(), self.var_text.get(),
+            self.var_schedule.get(), self.var_time.get(), weekdays,
+            self.var_date.get())
+        if values is None:
+            messagebox.showwarning("提示", error)
             return
-        ok, out = add_task(name, title, text, button,
-                           self.var_schedule.get(), time_str, weekdays)
+        if values["replaced"]:
+            messagebox.showinfo(
+                "任务名已自动修正",
+                "Windows 任务计划不接受这些字符，已换成全角：\n\n"
+                + "\n".join(values["replaced"])
+                + "\n\n新任务名：" + values["name"])
+        button = self.var_button.get().strip()
+        ok, out = add_task(values["name"], values["title"], values["text"], button,
+                           values["schedule"], values["time"], values["weekdays"],
+                           values["date_arg"])
         if ok:
-            messagebox.showinfo("成功", f"任务 [{TASK_PREFIX}{name}] 已添加")
+            note = "（提醒后会自行删除）" if values["schedule"] == "一次性" else ""
+            messagebox.showinfo("成功", f"任务 [{TASK_PREFIX}{values['name']}] 已添加{note}")
             self.var_name.set("")
             self.refresh()
         else:
