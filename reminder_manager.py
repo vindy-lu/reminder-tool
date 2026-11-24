@@ -235,11 +235,12 @@ def list_tasks():
 def build_trigger(schedule_type, time_str, weekdays, date_str=None):
     """构造 schtasks 的触发参数
 
-    一次性任务用 ONCE + -Z：执行完这一次后由系统自动删除任务，
-    不用再手动清理（用户说的"一次性提醒"）。
+    一次性任务用 ONCE；"执行后自动删除"不放 -Z（在 Win10 的 /SC ONCE 上
+    -Z 会报 "任务 XML 缺少个所需元素或属性 (EndBoundary)"），而是给弹窗脚本
+    多传一个 --delete-task，弹完自己把任务删掉。
     """
     if schedule_type == "一次性":
-        return ["-SC", "ONCE", "-SD", date_str, "-ST", time_str, "-Z"]
+        return ["-SC", "ONCE", "-SD", date_str, "-ST", time_str]
     if schedule_type == "每周":
         days = ",".join(WEEKDAY_MAP[d] for d in weekdays)
         return ["-SC", "WEEKLY", "-D", days, "-ST", time_str]
@@ -252,9 +253,11 @@ def add_task(name, title, text, button, schedule_type, time_str, weekdays, date_
     # 用 script_invocation() 拼命令行：exe 直接调用，py 用 python 解释器
     inv = script_invocation()
     cmd_str = " ".join(f'"{p}"' for p in inv)
-    cmd = ["schtasks", "-Create", "-TN", task_name, "-F",
-           "-TR",
-           f'{cmd_str} --title "{title}" --text "{text}" --button "{button}"']
+    app_args = f'{cmd_str} --title "{title}" --text "{text}" --button "{button}"'
+    if schedule_type == "一次性":
+        # 弹窗脚本跑完自己删任务，比 -Z 兼容性好
+        app_args += f' --delete-task "{task_name}"'
+    cmd = ["schtasks", "-Create", "-TN", task_name, "-F", "-TR", app_args]
     cmd += build_trigger(schedule_type, time_str, weekdays, date_str)
     return run_cmd(cmd)
 

@@ -8,6 +8,7 @@
     python clock_reminder.py --title "📋 日报提醒" --text "下班前记得提交日报" --button "去写日报"
 """
 import argparse
+import subprocess
 import tkinter as tk
 
 # ========== 默认内容（不带参数时的兜底，改这里也行） ==========
@@ -19,6 +20,25 @@ DEFAULT_TEXT = (
 )
 DEFAULT_BUTTON = "我知道了，去打卡"
 # ============================================================
+
+
+def delete_task(task_name):
+    """弹窗关掉后删除自己的计划任务（一次性提醒用）。
+
+    schtasks 的 /Z 只在部分计划类型上可用，/SC ONCE 直接带 /Z 会报
+    "任务 XML 缺少个所需元素或属性 (EndBoundary)"，所以改由弹窗脚本
+    自己删——这样各版本 Windows 都稳。
+    """
+    if not task_name:
+        return
+    try:
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", task_name, "/F"],
+            capture_output=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        pass  # 删除失败不影响已经弹过的提醒
 
 
 def show_reminder(title, text, button_text):
@@ -60,5 +80,8 @@ if __name__ == "__main__":
     parser.add_argument("--title", default=DEFAULT_TITLE, help="弹窗标题")
     parser.add_argument("--text", default=DEFAULT_TEXT, help="提醒内容，\\n 换行")
     parser.add_argument("--button", default=DEFAULT_BUTTON, help="按钮文字")
+    parser.add_argument("--delete-task", dest="delete_task", default="",
+                        help="弹窗关闭后删除的计划任务全名（一次性提醒用）")
     args = parser.parse_args()
     show_reminder(args.title, args.text, args.button)
+    delete_task(args.delete_task)

@@ -93,9 +93,43 @@ class ValidateFormTests(unittest.TestCase):
 
 class TriggerTests(unittest.TestCase):
     def test_once(self):
+        # 一次性不带 -Z：Win10 的 /SC ONCE 加 -Z 会报 EndBoundary
         self.assertEqual(
             rm.build_trigger("一次性", "17:00", [], "2026/12/01"),
-            ["-SC", "ONCE", "-SD", "2026/12/01", "-ST", "17:00", "-Z"])
+            ["-SC", "ONCE", "-SD", "2026/12/01", "-ST", "17:00"])
+
+    def test_add_task_once_passes_delete_task(self):
+        captured = {}
+
+        def fake(args):
+            captured["args"] = args
+            return True, "ok"
+
+        orig = rm.run_cmd
+        rm.run_cmd = fake
+        try:
+            rm.add_task("提醒", "标题", "内容", "好", "一次性", "17:00", [], "2026/12/01")
+        finally:
+            rm.run_cmd = orig
+        joined = " ".join(captured["args"])
+        self.assertIn("--delete-task", joined)
+        self.assertIn(rm.TASK_PREFIX + "提醒", joined)
+        self.assertNotIn("-Z", captured["args"])
+
+    def test_add_task_daily_has_no_delete_task(self):
+        captured = {}
+
+        def fake(args):
+            captured["args"] = args
+            return True, "ok"
+
+        orig = rm.run_cmd
+        rm.run_cmd = fake
+        try:
+            rm.add_task("打卡", "标题", "内容", "好", "每天", "17:00", [])
+        finally:
+            rm.run_cmd = orig
+        self.assertNotIn("--delete-task", " ".join(captured["args"]))
 
     def test_weekly(self):
         self.assertEqual(
